@@ -1,6 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 import json
+import urllib.parse
+import requests
+import re
+from bs4 import BeautifulSoup
 from ..database import get_db
 from .. import models, schemas
 from .auth import get_current_user
@@ -8,7 +12,7 @@ from ..services.db_adapters import sync_node_to_neo4j, sync_edge_to_neo4j
 
 router = APIRouter(prefix="/osint", tags=["osint"])
 
-# Simulated OSINT Database
+# Simulated OSINT Database (for instant demo matching fallback)
 OSINT_REGISTRY = {
     "suspect_alpha@shadow.com": [
         {"platform": "Instagram", "username": "alpha_shadow_99", "profile_url": "https://instagram.com/alpha_shadow_99", "details": "Private account. 430 followers. Bio: 'Live free. Chennai local.'", "linked_locations": "Chennai, TN"},
@@ -24,6 +28,145 @@ OSINT_REGISTRY = {
     ]
 }
 
+def clean_ddg_link(link):
+    if link.startswith("//"):
+        link = "https:" + link
+    parsed = urllib.parse.urlparse(link)
+    params = urllib.parse.parse_qs(parsed.query)
+    if "uddg" in params:
+        return params["uddg"][0]
+    return link
+
+def search_ddg_live(query):
+    results = []
+    try:
+        url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote(query)}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/100.0.0.0 Safari/537.36"
+        }
+        r = requests.get(url, headers=headers, timeout=5)
+        if r.status_code == 200:
+            soup = BeautifulSoup(r.text, 'html.parser')
+            for div in soup.find_all('div', class_='result'):
+                title_el = div.find('a', class_='result__a')
+                snippet_el = div.find('a', class_='result__snippet')
+                if title_el:
+                    link = title_el['href']
+                    clean_url = clean_ddg_link(link)
+                    
+                    # Skip local search links or help links
+                    if "duckduckgo.com" in clean_url:
+                        continue
+                        
+                    # Deduce platform name from link
+                    platform = "Web Mention"
+                    if "instagram.com" in clean_url:
+                        platform = "Instagram"
+                    elif "x.com" in clean_url or "twitter.com" in clean_url:
+                        platform = "Twitter/X"
+                    elif "facebook.com" in clean_url:
+                        platform = "Facebook"
+                    elif "linkedin.com" in clean_url:
+                        platform = "LinkedIn"
+                    elif "github.com" in clean_url:
+                        platform = "GitHub"
+                    elif "t.me" in clean_url or "telegram.org" in clean_url:
+                        platform = "Telegram"
+                        
+                    results.append({
+                        "platform": platform,
+                        "username": clean_url.split('/')[-1] or clean_url,
+                        "profile_url": clean_url,
+                        "details": snippet_el.text.strip()[:160] + "..." if snippet_el else "Public webpage mention.",
+                        "linked_locations": None
+                    })
+    except Exception as e:
+        print("DuckDuckGo OSINT search error:", e)
+    return results
+
+def get_github_profile(username):
+    try:
+        url = f"https://api.github.com/users/{username}"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(url, headers=headers, timeout=4)
+        if r.status_code == 200:
+            data = r.json()
+            return {
+                "platform": "GitHub",
+                "username": data.get("login", username),
+                "profile_url": data.get("html_url", f"https://github.com/{username}"),
+                "details": f"Active GitHub developer. Name: {data.get('name') or 'N/A'}. Repos: {data.get('public_repos')}. Bio: '{data.get('bio') or ''}'",
+                "linked_locations": data.get("location")
+            }
+    except Exception as e:
+        print("GitHub OSINT error:", e)
+    return None
+
+def get_reddit_profile(username):
+    try:
+        url = f"https://www.reddit.com/user/{username}/about.json"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        r = requests.get(url, headers=headers, timeout=4)
+        if r.status_code == 200:
+            data = r.json().get("data", {})
+            sub = data.get("subreddit") or {}
+            return {
+                "platform": "Reddit",
+                "username": username,
+                "profile_url": f"https://www.reddit.com/user/{username}",
+                "details": f"Reddit handle. Title: '{sub.get('title') or ''}'. Description: '{sub.get('public_description') or ''}'. Karma: {data.get('total_karma', 0)}",
+                "linked_locations": None
+            }
+    except Exception as e:
+        print("Reddit OSINT error:", e)
+    return None
+
+def get_domain_whois(domain):
+    try:
+        url = f"https://rdap.org/domain/{domain}"
+        r = requests.get(url, timeout=4)
+        if r.status_code == 200:
+            data = r.json()
+            registrars = [e.get('vcardArray')[1][1][3] for e in data.get('entities', []) if 'vcardArray' in e]
+            registrar = registrars[0] if registrars else "Unknown Registrar"
+            status = ", ".join(data.get("status", []))
+            return {
+                "platform": "WHOIS Registry",
+                "username": domain,
+                "profile_url": f"https://rdap.org/domain/{domain}",
+                "details": f"Domain registered. Registrar: {registrar}. Status: [{status}].",
+                "linked_locations": None
+            }
+    except Exception as e:
+        print("WHOIS RDAP OSINT error:", e)
+    return None
+
+def check_phone_metadata(phone):
+    clean_p = re.sub(r'[\s\-\(\)]', '', phone)
+    country = "Unknown Region"
+    carrier = "Unknown Carrier"
+    
+    if clean_p.startswith("+91") or (len(clean_p) == 10 and clean_p.startswith(("9", "8", "7", "6"))):
+        country = "India"
+        carrier = "Airtel / Jio / Vodafone-Idea"
+    elif clean_p.startswith("+1"):
+        country = "United States / Canada"
+        carrier = "Verizon / AT&T / T-Mobile"
+    elif clean_p.startswith("+44"):
+        country = "United Kingdom"
+        carrier = "EE / Vodafone / O2 / Three"
+    elif clean_p.startswith("+61"):
+        country = "Australia"
+        carrier = "Telstra / Optus / Vodafone"
+        
+    return {
+        "platform": "Truecaller Carrier Prediction",
+        "username": phone,
+        "profile_url": "#",
+        "details": f"Carrier: {carrier}. Region: {country}. Mapped via country dialing prefix rules.",
+        "linked_locations": country
+    }
+
 @router.get("/scan")
 def scan_osint(
     q: str = Query(..., description="Query key (phone, email, or username)"),
@@ -31,33 +174,49 @@ def scan_osint(
     q_lower = q.lower()
     results = []
     
-    # Simple check for matches
+    # 1. Pre-check for local simulated demo fallback
     for key, profiles in OSINT_REGISTRY.items():
         if key in q_lower or q_lower in key:
             results.extend(profiles)
             
-    # Default mock results if no exact match, so search is always functional
-    if not results:
-        results = [
-            {
-                "platform": "WHOIS Registry",
-                "username": f"domain_search_{q_lower}",
-                "profile_url": "#",
-                "details": f"No public profiles. Domain registrars scan matching keyword '{q}' logged as inactive.",
-                "linked_locations": None
-            },
-            {
-                "platform": "General Web Index",
-                "username": f"mention_{q_lower}",
-                "profile_url": "#",
-                "details": f"Index scanner matched 3 public web occurrences of keyword '{q}'.",
-                "linked_locations": None
-            }
-        ]
-        
+    # 2. Perform live OSINT harvesting from the real internet
+    # A. Search live web occurrences via DuckDuckGo
+    web_results = search_ddg_live(q)
+    results.extend(web_results)
+    
+    # B. Specific protocol lookups
+    if "@" in q:
+        domain = q.split('@')[-1]
+        whois_res = get_domain_whois(domain)
+        if whois_res:
+            results.append(whois_res)
+    elif re.search(r'\d{6,}', q): # is phone-like
+        phone_meta = check_phone_metadata(q)
+        results.append(phone_meta)
+    else: # is handle-like
+        # Check GitHub profile
+        gh_profile = get_github_profile(q)
+        if gh_profile:
+            results.append(gh_profile)
+        # Check Reddit profile
+        rd_profile = get_reddit_profile(q)
+        if rd_profile:
+            results.append(rd_profile)
+            
+    # Remove duplicate urls in scan
+    seen_urls = set()
+    unique_results = []
+    for r in results:
+        url = r.get("profile_url")
+        if url == "#":
+            unique_results.append(r)
+        elif url not in seen_urls:
+            seen_urls.add(url)
+            unique_results.append(r)
+            
     return {
         "query": q,
-        "results": results
+        "results": unique_results
     }
 
 @router.post("/{case_id}/import")

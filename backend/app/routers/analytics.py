@@ -58,12 +58,12 @@ def get_case_analytics(case_id: int, db: Session = Depends(get_db)):
         schemas.UrgencyCount(level=k, count=v) for k, v in urgency_counts.items()
     ]
     
-    # Simulated Agent Statuses
     agents = [
         "Classification Agent", "Entity Extraction Agent", "Relationship Intelligence Agent",
         "Timeline Reconstruction Agent", "Vision Intelligence Agent", "Conversation Intelligence Agent",
         "Risk Assessment Agent", "Evidence Prioritization Agent", "Cross-Case Intelligence Agent",
-        "Investigation Copilot Agent", "Explainability Agent", "Report Generation Agent"
+        "Investigation Copilot Agent", "Explainability Agent", "Report Generation Agent",
+        "Synthetic Content & Metadata Integrity Agent"
     ]
     
     agent_status_list = []

@@ -1,6 +1,9 @@
 import re
 import logging
+import json
+import requests
 from typing import Dict, Any, List, Tuple
+from ..config import settings
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -34,6 +37,98 @@ except Exception as e:
         f"Falling back to high-performance local keyword/context heuristics. Error: {e}"
     )
     transformers_loaded = False
+
+
+def query_local_llm(prompt: str, system_prompt: str = "You are a forensic investigation helper.") -> Any:
+    """Queries a local Ollama LLM endpoint if configured and available."""
+    if not settings.OLLAMA_HOST:
+        return None
+    try:
+        url = f"http://{settings.OLLAMA_HOST}:11434/api/generate"
+        payload = {
+            "model": "llama3",
+            "prompt": f"<|system|>\n{system_prompt}\n<|user|>\n{prompt}\n<|assistant|>",
+            "stream": False,
+            "options": {"temperature": 0.1}
+        }
+        response = requests.post(url, json=payload, timeout=5)
+        if response.status_code == 200:
+            return response.json().get("response", "").strip()
+    except Exception as e:
+        logger.warning(f"Failed to query local LLM at {settings.OLLAMA_HOST}: {e}")
+    return None
+
+
+def detect_synthetic_image(metadata: dict) -> Tuple[bool, float, str]:
+    """
+    Forensics check: scans image metadata (EXIF/tags) for signs of artificial generation,
+    image processing software alteration, or metadata manipulation.
+    Returns: (is_manipulated/synthetic: bool, confidence: float, reasoning: str)
+    """
+    exif = metadata.get("exif", {})
+    if not exif:
+        # If there's no EXIF details but width/height exist, it's suspicious but not conclusive
+        return False, 0.50, "No image metadata/EXIF records found."
+
+    software_indicators = [
+        "photoshop", "gimp", "lightroom", "pixelmator", "canva", "midjourney", 
+        "stable diffusion", "dall-e", "adobe", "imagemagick", "snapseed"
+    ]
+    
+    # Check Software tag
+    software_val = str(exif.get("Software", "")).lower()
+    for ind in software_indicators:
+        if ind in software_val:
+            return True, 0.95, f"EXIF metadata contains image modification software signature: '{exif.get('Software')}'."
+
+    # Check Artist / Creator tags for synthetic/AI indicators
+    artist_val = str(exif.get("Artist", "")).lower()
+    creator_val = str(exif.get("XPAuthor", "")).lower()
+    for tag in [artist_val, creator_val]:
+        if "generative" in tag or "ai generated" in tag or "synthetic" in tag:
+            return True, 0.99, f"Metadata field explicitly states synthetic creation: '{tag}'."
+
+    # Check for missing native camera sensor tags on large resolution images (indicates potential rendering or stripping)
+    if "Model" not in exif and "Make" not in exif:
+        # Standard cameras/phones write model info. Missing it entirely on modern files points to stripping/spoofing.
+        return True, 0.75, "Missing native camera model/make tags. EXIF has likely been stripped or manipulated."
+
+    return False, 0.90, "No editing software signatures or metadata anomalies detected in EXIF tags."
+
+
+def detect_synthetic_text(text: str) -> Tuple[bool, float, str]:
+    """
+    Scans text content for signs of AI-generation (LLM outputs).
+    Returns: (is_synthetic: bool, confidence: float, reasoning: str)
+    """
+    text_lower = text.lower()
+    
+    # Check for typical LLM system leakage or common introductory/transition patterns
+    llm_phrases = [
+        "as an ai language model",
+        "as a large language model",
+        "delve into",
+        "in summary",
+        "furthermore",
+        "moreover",
+        "testament to",
+        "highly complex",
+        "it is important to note",
+        "certainly! i can assist"
+    ]
+    
+    matched = [p for p in llm_phrases if p in text_lower]
+    if len(matched) >= 2:
+        return True, 0.85, f"High probability of AI-generated content. Found common LLM signatures: {', '.join(matched)}."
+    elif len(matched) == 1:
+        return True, 0.65, f"Potential AI-generated content. Found signature: '{matched[0]}'."
+        
+    # Check formatting structures (overly structured lists with colons and summary conclusions)
+    bullet_count = len(re.findall(r'^\s*[-*•]\s+\*\*.*?\*\*:', text, re.MULTILINE))
+    if bullet_count >= 3 and "in conclusion" in text_lower:
+        return True, 0.70, f"Detected highly structured summary list patterns typical of conversational LLMs."
+
+    return False, 0.90, "Conversational dynamics appear native (no generative AI markers or system leaks detected)."
 
 
 # --- TIER 1: FAST TRIAGE CLASSIFIER (Bag-of-words / TF-IDF Heuristics) ---
@@ -175,3 +270,88 @@ def run_deep_entity_extraction(text: str) -> List[Dict[str, Any]]:
             extracted_entities.append({"name": "Anitha (Victim)", "type": "Person", "score": 0.95})
             
     return extracted_entities
+
+def verify_conversational_sentiment_flow(messages: List[Dict[str, Any]], trigger_index: int, window_size: int = 4) -> Dict[str, Any]:
+    """
+    Analyzes the sentiment flow trajectory before and after a red flag trigger 
+    to verify if the context is malicious grooming/coercion or benign banter/joking.
+    """
+    start_idx = max(0, trigger_index - window_size)
+    end_idx = min(len(messages), trigger_index + window_size + 1)
+    
+    context_window = messages[start_idx:end_idx]
+    
+    window_sentiments = []
+    laugh_token_count = 0
+    gaming_token_count = 0
+    
+    gaming_slang = {"noob", "clutch", "spawn", "pwn", "frag", "kill you", "cod", "fortnite", "pubg", "game"}
+    laugh_tokens = {"lol", "haha", "lmao", "rofl", "😂", "xd", "joking", "jk"}
+    
+    for idx, msg in enumerate(context_window):
+        text = msg.get("text", "").lower()
+        sender = msg.get("sender", "unknown")
+        
+        # Calculate sentiment for this specific message
+        label, score = run_deep_sentiment_analysis(text)
+        sentiment_val = -score if label == "NEGATIVE" else score
+        
+        has_laugh = any(t in text for t in laugh_tokens)
+        has_gaming = any(t in text for t in gaming_slang)
+        
+        if has_laugh:
+            laugh_token_count += 1
+        if has_gaming:
+            gaming_token_count += 1
+            
+        window_sentiments.append({
+            "relative_index": idx - (trigger_index - start_idx),
+            "sender": sender,
+            "text": text,
+            "sentiment": sentiment_val,
+            "has_laugh": has_laugh,
+            "has_gaming": has_gaming
+        })
+        
+    # Decision Analysis
+    # 1. Symmetric laugh checks: Do both senders laugh?
+    senders_who_laughed = {item["sender"] for item in window_sentiments if item["has_laugh"]}
+    is_symmetric_laughter = len(senders_who_laughed) >= 2
+    
+    # 2. Gaming context check
+    is_gaming_context = gaming_token_count >= 1
+    
+    # 3. Sentiment recovery check after the negative trigger
+    trigger_win_idx = trigger_index - start_idx
+    post_trigger_sentiments = [item["sentiment"] for item in window_sentiments[trigger_win_idx + 1:]]
+    
+    has_sentiment_recovery = False
+    if post_trigger_sentiments:
+        average_post_sentiment = sum(post_trigger_sentiments) / len(post_trigger_sentiments)
+        if average_post_sentiment > 0.1: 
+            has_sentiment_recovery = True
+            
+    is_banter = False
+    confidence = 0.50
+    reasoning = "Inconclusive conversational context. Manual audit required."
+    
+    if is_symmetric_laughter or (is_gaming_context and has_sentiment_recovery):
+        is_banter = True
+        confidence = 0.85 if is_symmetric_laughter else 0.70
+        reasoning = "Benign Banter Context: Sentiment flow shows rapid recovery to positive bounds and mutual laughter/slang indicators."
+    elif not has_sentiment_recovery and not is_symmetric_laughter:
+        is_banter = False
+        confidence = 0.90
+        reasoning = "Threat Escalation Context: Sentiment remains consistently negative or submissive post-trigger with no symmetric recovery or laughter."
+        
+    return {
+        "is_banter": is_banter,
+        "confidence": confidence,
+        "reasoning": reasoning,
+        "sentiment_flow": window_sentiments,
+        "metrics": {
+            "symmetric_laughter": is_symmetric_laughter,
+            "gaming_context": is_gaming_context,
+            "sentiment_recovery": has_sentiment_recovery
+        }
+    }

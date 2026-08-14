@@ -114,4 +114,21 @@ export const api = {
     fetchAPI(`/osint/${caseId}/import?platform=${encodeURIComponent(platform)}&username=${encodeURIComponent(username)}&details=${encodeURIComponent(details)}${linkedLocations ? `&linked_locations=${encodeURIComponent(linkedLocations)}` : ""}${originQuery ? `&origin_query=${encodeURIComponent(originQuery)}` : ""}`, {
       method: "POST"
     }),
+
+  // Forensics
+  getForensicSources: (caseId: number) => fetchAPI(`/forensics/case/${caseId}/sources`),
+  registerForensicSource: (caseId: number, filepath: string, fileType: string, filename?: string) =>
+    fetchAPI(`/forensics/register`, {
+      method: "POST",
+      body: JSON.stringify({ case_id: caseId, filepath, file_type: fileType, filename }),
+    }),
+  getDiskStructure: (evidenceId: number) => fetchAPI(`/forensics/disk/${evidenceId}/structure`),
+  extractVirtualFile: (evidenceId: number, path: string) =>
+    fetchAPI(`/forensics/disk/${evidenceId}/extract?path=${encodeURIComponent(path)}`),
+  checkFileHash: (evidenceId: number, sha256: string, filepath?: string) =>
+    fetchAPI(`/forensics/disk/${evidenceId}/hash-check`, {
+      method: "POST",
+      body: JSON.stringify({ sha256, filepath }),
+    }),
+  getMemoryAnalysis: (evidenceId: number) => fetchAPI(`/forensics/memory/${evidenceId}/analysis`),
 };

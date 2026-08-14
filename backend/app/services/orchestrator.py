@@ -4,7 +4,7 @@ from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from .. import models
 from .db_adapters import sync_node_to_neo4j, sync_edge_to_neo4j, index_text_in_qdrant
-from .custom_models import triage_text_fast, run_deep_sentiment_analysis, run_deep_entity_extraction
+from .custom_models import triage_text_fast, run_deep_sentiment_analysis, run_deep_entity_extraction, detect_synthetic_image, detect_synthetic_text
 
 # Sample databases of "cross-case" matches to simulate Agent 9
 SHARED_INTEL_PHONES = ["+91 98765 43210", "+1 555-0199", "+91 99999 88888"]
@@ -307,6 +307,19 @@ def run_agentic_pipeline(db: Session, evidence_id: int):
     # --- AGENT 12: Report Generation Agent ---
     add_decision("Agent 12: Report Generation Agent", "PDF summary layout prepared for download.", 0.95, "Synthesized metadata, risk outputs, and timeline metrics into standard reporting format.")
 
+    # --- AGENT 13: Synthetic Content & Metadata Integrity Agent ---
+    syn_flagged = False
+    syn_conf = 0.90
+    syn_reason = "No anomalies detected in file structure or metadata parameters."
+    
+    if file_type == "Image":
+        syn_flagged, syn_conf, syn_reason = detect_synthetic_image(meta)
+    elif file_type == "Conversation" or file_type == "Document":
+        syn_flagged, syn_conf, syn_reason = detect_synthetic_text(text_content)
+        
+    syn_decision = "Warning: Potential synthetic or manipulated content detected." if syn_flagged else "Verified: Content and metadata integrity consistent with native origin."
+    add_decision("Agent 13: Synthetic Content & Metadata Integrity Agent", syn_decision, syn_conf, syn_reason)
+
     # Mark evidence as processed
     evidence.status = "processed"
     
@@ -316,7 +329,7 @@ def run_agentic_pipeline(db: Session, evidence_id: int):
         user="ACPIA Orchestrator",
         action="AI_DECISION",
         sha256_hash=evidence.sha256,
-        details=f"Analyzed file {filename} and executed Agents 1-12. Risk determined: {risk_level}."
+        details=f"Analyzed file {filename} and executed Agents 1-13. Risk determined: {risk_level}."
     )
     db.add(audit)
     
