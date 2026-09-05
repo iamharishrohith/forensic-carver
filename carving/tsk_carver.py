@@ -9,19 +9,17 @@ except ImportError:
 
 
 class TskCarver:
-    """Optional filesystem-aware carver using pytsk3 when available."""
-
     @classmethod
     def is_available(cls):
         return HAS_PYTSK3
 
     @classmethod
-    def carve_filesystem(cls, image_path: str, output_dir: str):
+    def carve_filesystem(cls, image_path, output_dir):
         if not HAS_PYTSK3:
             return []
 
         os.makedirs(output_dir, exist_ok=True)
-        carved = []
+        carved_files = []
 
         try:
             img = pytsk3.Img_Info(image_path)
@@ -42,17 +40,17 @@ class TskCarver:
             except Exception:
                 continue
 
-            def scan_dir(directory, cur_path=""):
+            def walk_directory(dir_obj, current_path=""):
                 nonlocal count
-                for entry in directory:
+                for entry in dir_obj:
                     if not hasattr(entry, "info") or not entry.info.name:
                         continue
                     name = entry.info.name.name.decode("utf-8", errors="ignore")
                     if name in [".", ".."]:
                         continue
 
-                    is_unalloc = entry.info.meta and (entry.info.meta.flags & pytsk3.TSK_FS_META_FLAG_UNALLOC)
-                    if is_unalloc and entry.info.meta.type == pytsk3.TSK_FS_META_TYPE_REG:
+                    is_deleted = entry.info.meta and (entry.info.meta.flags & pytsk3.TSK_FS_META_FLAG_UNALLOC)
+                    if is_deleted and entry.info.meta.type == pytsk3.TSK_FS_META_TYPE_REG:
                         size = entry.info.meta.size
                         if 0 < size < 100 * 1024 * 1024:
                             try:
@@ -61,7 +59,7 @@ class TskCarver:
                                 ext = name.split(".")[-1].lower() if "." in name else "bin"
 
                                 count += 1
-                                art_id = f"tsk_recovered_{count:04d}"
+                                art_id = f"tsk_{count:04d}"
                                 filename = f"{art_id}_{name}"
                                 out_path = os.path.join(output_dir, filename)
 
@@ -70,10 +68,8 @@ class TskCarver:
 
                                 valid, meta = inspect_artifact(ext, data)
                                 meta["original_filename"] = name
-                                if entry.info.meta.mtime:
-                                    meta["mtime_epoch"] = entry.info.meta.mtime
 
-                                carved.append({
+                                carved_files.append({
                                     "artifact_id": art_id,
                                     "filename": filename,
                                     "original_name": name,
@@ -94,14 +90,14 @@ class TskCarver:
 
                     if entry.info.meta and entry.info.meta.type == pytsk3.TSK_FS_META_TYPE_DIR:
                         try:
-                            scan_dir(entry.as_directory(), os.path.join(cur_path, name))
+                            walk_directory(entry.as_directory(), os.path.join(current_path, name))
                         except Exception:
                             pass
 
             try:
-                root = fs.open_dir(path="/")
-                scan_dir(root)
+                root_dir = fs.open_dir(path="/")
+                walk_directory(root_dir)
             except Exception:
                 pass
 
-        return carved
+        return carved_files

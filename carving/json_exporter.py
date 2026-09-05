@@ -4,11 +4,9 @@ import hashlib
 from datetime import datetime, timezone
 
 
-def make_manifest(source_path: str, artifacts: list, duration_sec: float, active_engine: str, case_id: str = None) -> dict:
-    """Builds clean manifest dictionary."""
+def make_manifest(source_path, artifacts, duration_sec, active_engine, case_id=None):
     size = os.path.getsize(source_path) if os.path.exists(source_path) else 0
 
-    # compute source image sha256
     source_sha256 = "UNKNOWN"
     if os.path.exists(source_path):
         h = hashlib.sha256()
@@ -18,11 +16,13 @@ def make_manifest(source_path: str, artifacts: list, duration_sec: float, active
         source_sha256 = h.hexdigest()
 
     type_counts = {}
-    for a in artifacts:
-        m = a.get("mime_type", "unknown")
+    for item in artifacts:
+        m = item.get("mime_type", "unknown")
         type_counts[m] = type_counts.get(m, 0) + 1
 
-    return {
+    total_bytes = sum(item.get("size_bytes", 0) for item in artifacts)
+
+    manifest = {
         "report_type": "FORENSIC_CARVING_MANIFEST",
         "version": "1.0.0",
         "case_id": case_id or "ACPIA-LOCAL-CASE",
@@ -39,22 +39,23 @@ def make_manifest(source_path: str, artifacts: list, duration_sec: float, active
         },
         "summary": {
             "total_artifacts_recovered": len(artifacts),
-            "total_recovered_bytes": sum(a.get("size_bytes", 0) for a in artifacts),
+            "total_recovered_bytes": total_bytes,
             "artifacts_by_type": type_counts,
             "integrity_status": "ALL_HASHES_VERIFIED" if artifacts else "NO_ARTIFACTS_FOUND",
         },
         "artifacts": artifacts,
     }
+    return manifest
 
 
-def write_json(manifest: dict, out_path: str):
-    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
+def write_json(manifest, output_file):
+    os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
+    with open(output_file, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
 
 
-def write_ndjson(artifacts: list, out_path: str):
-    os.makedirs(os.path.dirname(os.path.abspath(out_path)), exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as f:
-        for a in artifacts:
-            f.write(json.dumps(a) + "\n")
+def write_ndjson(artifacts, output_file):
+    os.makedirs(os.path.dirname(os.path.abspath(output_file)), exist_ok=True)
+    with open(output_file, "w", encoding="utf-8") as f:
+        for item in artifacts:
+            f.write(json.dumps(item) + "\n")

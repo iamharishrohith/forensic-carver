@@ -1,6 +1,3 @@
-# File signatures and carving thresholds
-
-# 4MB chunks with 64KB overlap so we don't miss headers split across chunks
 CHUNK_SIZE = 4 * 1024 * 1024
 OVERLAP_SIZE = 64 * 1024
 
@@ -26,13 +23,6 @@ SIGNATURES = {
         "trailer": b"\x00\x3B",
         "max_size": 25 * 1024 * 1024,
     },
-    "gif87": {
-        "ext": "gif",
-        "mime": "image/gif",
-        "header": b"GIF87a",
-        "trailer": b"\x00\x3B",
-        "max_size": 25 * 1024 * 1024,
-    },
     "pdf": {
         "ext": "pdf",
         "mime": "application/pdf",
@@ -52,7 +42,7 @@ SIGNATURES = {
         "ext": "sqlite",
         "mime": "application/x-sqlite3",
         "header": b"SQLite format 3\x00",
-        "trailer": None, # computed dynamically from header page count
+        "trailer": None,
         "max_size": 500 * 1024 * 1024,
     },
     "webp": {

@@ -11,8 +11,8 @@ class CarvingManager:
         self.prefer_filesystem = prefer_filesystem
         self.carver = SignatureCarver(chunk_size=chunk_size, overlap_size=overlap_size)
 
-    def process_source(self, source_path: str, output_dir: str, case_id: str = None, json_output_filename: str = "carving_manifest.json", export_ndjson: bool = True):
-        t0 = time.perf_counter()
+    def process_source(self, source_path, output_dir, case_id=None, json_output_filename="carving_manifest.json", export_ndjson=True):
+        start_time = time.perf_counter()
         os.makedirs(output_dir, exist_ok=True)
         rec_dir = os.path.join(output_dir, "recovered_artifacts")
         os.makedirs(rec_dir, exist_ok=True)
@@ -20,19 +20,17 @@ class CarvingManager:
         engine_used = "SIGNATURE_STREAM_SLIDING_WINDOW"
         artifacts = []
 
-        # 1. Try filesystem undelete if pytsk3 is available and requested
         if self.prefer_filesystem and TskCarver.is_available():
-            tsk_items = TskCarver.carve_filesystem(source_path, rec_dir)
-            if tsk_items:
+            tsk_results = TskCarver.carve_filesystem(source_path, rec_dir)
+            if tsk_results:
                 engine_used = "TSK_FILESYSTEM_AWARE"
-                artifacts.extend(tsk_items)
+                artifacts.extend(tsk_results)
 
-        # 2. Fallback to raw stream carver
         if not artifacts:
-            sig_items = self.carver.carve(source_path, rec_dir, case_id=case_id)
-            artifacts.extend(sig_items)
+            sig_results = self.carver.carve(source_path, rec_dir, case_id=case_id)
+            artifacts.extend(sig_results)
 
-        elapsed = time.perf_counter() - t0
+        elapsed = time.perf_counter() - start_time
 
         manifest = make_manifest(
             source_path=source_path,
@@ -42,12 +40,10 @@ class CarvingManager:
             case_id=case_id,
         )
 
-        # Save JSON
         json_path = os.path.join(output_dir, json_output_filename)
         write_json(manifest, json_path)
         manifest["manifest_saved_to"] = os.path.abspath(json_path)
 
-        # Save NDJSON
         if export_ndjson:
             nd_path = os.path.join(output_dir, "carving_manifest.ndjson")
             write_ndjson(artifacts, nd_path)
