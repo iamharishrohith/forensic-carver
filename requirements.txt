@@ -1,0 +1,4 @@
+# Optional packages for forensic carver (Pure-Python core runs with 0 dependencies)
+pytest>=7.4.0
+blake3>=0.3.3
+pytsk3>=20231007

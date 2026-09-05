@@ -1,28 +1,17 @@
-# Python virtual env & caches
-.venv/
-backend/.venv/
 __pycache__/
-backend/__pycache__/
-backend/app/__pycache__/
-backend/app/routers/__pycache__/
-backend/app/services/__pycache__/
-*.pyc
-
-# Node modules & builds
-node_modules/
-frontend/node_modules/
-frontend/.next/
-frontend/out/
-frontend/.turbo/
-
-# Evidence uploads (preserving directory structure if needed)
-backend/uploads/*
-!backend/uploads/.gitkeep
-
-# IDEs & Environment
-.vscode/
-.idea/
-.env
-.env.local
+*.py[cod]
+*$py.class
+.pytest_cache/
+.coverage
+htmlcov/
+*.raw
+*.dd
+*.img
+evidence_cache/
+carved_output/
+carved_evidence/
+live_test_output/
+demo_carved_output/
+.venv/
+env/
 .DS_Store
-Thumbs.db
