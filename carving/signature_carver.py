@@ -1,56 +1,42 @@
-"""
-Sliding-Window Signature-Based File Carver
-Scans raw disk images, mounted volumes, or unallocated streams for magic headers and trailers.
-Includes JPEG segment parsing (to avoid stopping on embedded EXIF thumbnails),
-dynamic SQLite page counting, RIFF/WebP size calculations, and overlap window buffering.
-"""
-
 import os
-import io
 import struct
-from typing import Generator, Dict, Any, Optional, List, BinaryIO
-
-from .config import CARVE_SIGNATURES, DEFAULT_CHUNK_SIZE, DEFAULT_OVERLAP_SIZE
+from .config import SIGNATURES, CHUNK_SIZE, OVERLAP_SIZE
 from .sqlite_carver import SQLiteCarver
-from .validator import calculate_hashes, validate_and_extract_metadata
+from .validator import get_hashes, inspect_artifact
 
 
-def parse_jpeg_length(buffer: bytes, start_offset: int = 0, max_size: int = 50 * 1024 * 1024) -> Optional[int]:
+def find_jpeg_end(buffer: bytes, start: int = 0, max_size: int = 50 * 1024 * 1024):
     """
-    Parses JPEG segment markers (APP0, APP1/EXIF, DQT, DHT, SOF) by length,
-    skipping embedded EXIF thumbnail trailers and finding the true terminal EOI (FF D9).
+    Walks JPEG markers to find the real EOI (FF D9).
+    Skips embedded EXIF thumbnail headers to prevent truncating camera photos.
     """
-    pos = start_offset + 2
-    buf_len = len(buffer)
-    limit = min(buf_len, start_offset + max_size)
+    pos = start + 2
+    limit = min(len(buffer), start + max_size)
 
     while pos + 4 <= limit:
         if buffer[pos] != 0xFF:
             break
         marker = buffer[pos + 1]
-        
+
         # Standalone markers with no length payload
-        if marker in [0xD8, 0xD9]:
-            pos += 2
-            continue
-        if 0xD0 <= marker <= 0xD7:  # RST restart markers
+        if marker in [0xD8, 0xD9] or (0xD0 <= marker <= 0xD7):
             pos += 2
             continue
 
-        # Start of Scan (SOS) - Image data stream begins
+        # Start of scan (SOS) -> image data begins
         if marker == 0xDA:
             seg_len = int.from_bytes(buffer[pos + 2 : pos + 4], "big")
             pos += 2 + seg_len
-            
-            # Scan scan-data until true un-escaped FFD9 EOI
+
+            # Scan raw payload for terminal FF D9 EOI
             while pos + 1 < limit:
                 if buffer[pos] == 0xFF:
                     m = buffer[pos + 1]
-                    if m == 0xD9:  # Genuine End of Image
-                        return (pos + 2) - start_offset
-                    elif m == 0x00:  # Escaped byte-stuffed 0xFF
+                    if m == 0xD9: # genuine EOI
+                        return (pos + 2) - start
+                    elif m == 0x00: # escaped FF byte stuffing
                         pos += 2
-                    elif 0xD0 <= m <= 0xD7:  # RST marker inside scan
+                    elif 0xD0 <= m <= 0xD7: # RST marker
                         pos += 2
                     else:
                         pos += 1
@@ -58,200 +44,174 @@ def parse_jpeg_length(buffer: bytes, start_offset: int = 0, max_size: int = 50 *
                     pos += 1
             break
 
-        # Standard segment: read 2-byte big-endian length and skip
+        # Standard segment -> read 2-byte big-endian length and jump over it
         seg_len = int.from_bytes(buffer[pos + 2 : pos + 4], "big")
         pos += 2 + seg_len
 
-    # Fallback to last FFD9 within max_size if segment walk did not terminate
-    last_eoi = buffer.rfind(b"\xFF\xD9", start_offset + 2, start_offset + max_size)
+    # Fallback to last FFD9 within range if structure walk did not hit SOS
+    last_eoi = buffer.rfind(b"\xFF\xD9", start + 2, start + max_size)
     if last_eoi != -1:
-        return (last_eoi + 2) - start_offset
+        return (last_eoi + 2) - start
 
     return None
 
 
 class SignatureCarver:
-    """Stream-based magic-byte and trailer file carver."""
-
-    def __init__(
-        self,
-        chunk_size: int = DEFAULT_CHUNK_SIZE,
-        overlap_size: int = DEFAULT_OVERLAP_SIZE,
-        signatures: Optional[Dict[str, Dict[str, Any]]] = None,
-    ):
+    def __init__(self, chunk_size=CHUNK_SIZE, overlap_size=OVERLAP_SIZE, signatures=None):
         self.chunk_size = chunk_size
         self.overlap_size = overlap_size
-        self.signatures = signatures or CARVE_SIGNATURES
+        self.signatures = signatures or SIGNATURES
 
-    def carve_file_stream(
-        self,
-        file_path_or_stream: Any,
-        output_dir: str,
-        case_id: Optional[str] = None,
-    ) -> List[Dict[str, Any]]:
-        """
-        Scans a raw evidence file or binary stream and extracts all carved artifacts to output_dir.
-        Returns a list of recovered artifact metadata dictionaries.
-        """
+    def carve(self, source, output_dir, case_id=None):
+        """Scans source file or stream in sliding chunks and extracts all matching files."""
         os.makedirs(output_dir, exist_ok=True)
-        carved_artifacts: List[Dict[str, Any]] = []
-        carved_counter = 0
+        carved = []
+        count = 0
 
-        if isinstance(file_path_or_stream, str):
-            stream = open(file_path_or_stream, "rb")
-            should_close = True
-        else:
-            stream = file_path_or_stream
-            should_close = False
+        is_path = isinstance(source, str)
+        stream = open(source, "rb") if is_path else source
 
         try:
             stream_pos = 0
-            carryover_buffer = b""
+            carry = b""
 
             while True:
                 chunk = stream.read(self.chunk_size)
-                if not chunk and not carryover_buffer:
+                if not chunk and not carry:
                     break
 
-                buffer_data = carryover_buffer + chunk
-                buffer_base_offset = stream_pos - len(carryover_buffer)
-                buffer_len = len(buffer_data)
+                buf = carry + chunk
+                base_offset = stream_pos - len(carry)
+                buf_len = len(buf)
 
-                # Scan buffer for supported signatures
-                for sig_key, sig_info in self.signatures.items():
-                    header = sig_info["header"]
-                    trailer = sig_info.get("trailer")
-                    max_size = sig_info.get("max_size", 50 * 1024 * 1024)
-                    ext = sig_info["extension"]
-                    mime_type = sig_info["mime_type"]
+                for sig_name, sig in self.signatures.items():
+                    header = sig["header"]
+                    trailer = sig.get("trailer")
+                    max_len = sig.get("max_size", 50 * 1024 * 1024)
+                    ext = sig["ext"]
+                    mime = sig["mime"]
 
-                    start_idx = 0
+                    start = 0
                     while True:
-                        header_pos = buffer_data.find(header, start_idx)
-                        if header_pos == -1:
+                        h_pos = buf.find(header, start)
+                        if h_pos == -1:
                             break
 
-                        # Sub-header verification if applicable (e.g. WEBP inside RIFF)
-                        if "sub_header" in sig_info:
-                            sub_header = sig_info["sub_header"]
-                            if buffer_data[header_pos + 8 : header_pos + 8 + len(sub_header)] != sub_header:
-                                start_idx = header_pos + len(header)
+                        # Check sub-header if specified (like WEBP inside RIFF)
+                        if "sub_header" in sig:
+                            sub = sig["sub_header"]
+                            if buf[h_pos + 8 : h_pos + 8 + len(sub)] != sub:
+                                start = h_pos + len(header)
                                 continue
 
                         end_pos = -1
 
-                        # Sizing Logic 1: Smart Segment-Aware JPEG
-                        if sig_key in ["jpeg"]:
-                            jpeg_len = parse_jpeg_length(buffer_data, header_pos, max_size)
-                            if jpeg_len is not None:
-                                end_pos = header_pos + jpeg_len
+                        # Sizing 1: Smart JPEG segment parser
+                        if sig_name == "jpeg":
+                            jlen = find_jpeg_end(buf, h_pos, max_len)
+                            if jlen is not None:
+                                end_pos = h_pos + jlen
                             else:
                                 # Read ahead if file extends past current chunk
-                                needed_bytes = min(max_size, 10 * 1024 * 1024)
-                                curr_tell = stream.tell()
-                                read_ahead = stream.read(needed_bytes)
-                                stream.seek(curr_tell)
-                                if read_ahead:
-                                    extended_buf = buffer_data[header_pos:] + read_ahead
-                                    jpeg_len = parse_jpeg_length(extended_buf, 0, max_size)
-                                    if jpeg_len is not None:
-                                        end_pos = header_pos + jpeg_len
-                                        buffer_data = buffer_data[:header_pos] + extended_buf[:jpeg_len]
-                                        buffer_len = len(buffer_data)
+                                cur = stream.tell()
+                                extra = stream.read(min(max_len, 10 * 1024 * 1024))
+                                stream.seek(cur)
+                                if extra:
+                                    ext_buf = buf[h_pos:] + extra
+                                    jlen = find_jpeg_end(ext_buf, 0, max_len)
+                                    if jlen is not None:
+                                        end_pos = h_pos + jlen
+                                        buf = buf[:h_pos] + ext_buf[:jlen]
+                                        buf_len = len(buf)
 
-                        # Sizing Logic 2: SQLite dynamic page table length
-                        elif sig_key == "sqlite":
-                            calc_len = SQLiteCarver.calculate_length_from_offset(buffer_data, header_pos)
-                            if calc_len and calc_len <= max_size:
-                                if header_pos + calc_len <= buffer_len:
-                                    end_pos = header_pos + calc_len
+                        # Sizing 2: SQLite dynamic page calculation
+                        elif sig_name == "sqlite":
+                            dlen = SQLiteCarver.get_length(buf, h_pos)
+                            if dlen and dlen <= max_len:
+                                if h_pos + dlen <= buf_len:
+                                    end_pos = h_pos + dlen
                                 else:
-                                    needed_bytes = (header_pos + calc_len) - buffer_len
-                                    curr_tell = stream.tell()
-                                    read_ahead = stream.read(needed_bytes)
-                                    stream.seek(curr_tell)
-                                    if len(read_ahead) == needed_bytes:
-                                        full_db_data = buffer_data[header_pos:] + read_ahead
-                                        end_pos = header_pos + calc_len
-                                        buffer_data = buffer_data[:header_pos] + full_db_data
-                                        buffer_len = len(buffer_data)
+                                    needed = (h_pos + dlen) - buf_len
+                                    cur = stream.tell()
+                                    extra = stream.read(needed)
+                                    stream.seek(cur)
+                                    if len(extra) == needed:
+                                        full_data = buf[h_pos:] + extra
+                                        end_pos = h_pos + dlen
+                                        buf = buf[:h_pos] + full_data
+                                        buf_len = len(buf)
 
-                        # Sizing Logic 3: WebP dynamic length from RIFF header
-                        elif sig_key == "webp":
-                            if header_pos + 8 <= buffer_len:
-                                riff_payload_len = struct.unpack("<I", buffer_data[header_pos + 4 : header_pos + 8])[0]
-                                total_webp_len = riff_payload_len + 8
-                                if total_webp_len <= max_size and header_pos + total_webp_len <= buffer_len:
-                                    end_pos = header_pos + total_webp_len
+                        # Sizing 3: WebP RIFF length
+                        elif sig_name == "webp":
+                            if h_pos + 8 <= buf_len:
+                                payload_len = struct.unpack("<I", buf[h_pos + 4 : h_pos + 8])[0]
+                                wlen = payload_len + 8
+                                if wlen <= max_len and h_pos + wlen <= buf_len:
+                                    end_pos = h_pos + wlen
 
-                        # Sizing Logic 4: PDF with trailing newline detection
-                        elif sig_key == "pdf":
-                            trailer_pos = buffer_data.find(b"%%EOF", header_pos + len(header))
-                            if trailer_pos != -1 and (trailer_pos - header_pos) <= max_size:
-                                end_pos = trailer_pos + 5
-                                # Check for trailing \r, \n, or \r\n immediately following %%EOF
-                                if end_pos + 1 <= buffer_len and buffer_data[end_pos : end_pos + 2] == b"\r\n":
+                        # Sizing 4: PDF with trailing newline check
+                        elif sig_name == "pdf":
+                            t_pos = buf.find(b"%%EOF", h_pos + len(header))
+                            if t_pos != -1 and (t_pos - h_pos) <= max_len:
+                                end_pos = t_pos + 5
+                                if end_pos + 1 <= buf_len and buf[end_pos : end_pos + 2] == b"\r\n":
                                     end_pos += 2
-                                elif end_pos < buffer_len and buffer_data[end_pos : end_pos + 1] in [b"\n", b"\r"]:
+                                elif end_pos < buf_len and buf[end_pos : end_pos + 1] in [b"\n", b"\r"]:
                                     end_pos += 1
 
-                        # Sizing Logic 5: Standard Header-Trailer matching (PNG, GIF, ZIP)
+                        # Sizing 5: Standard header/trailer (PNG, GIF, ZIP)
                         elif trailer:
-                            trailer_pos = buffer_data.find(trailer, header_pos + len(header))
-                            if trailer_pos != -1:
-                                potential_len = (trailer_pos + len(trailer)) - header_pos
-                                if potential_len <= max_size:
-                                    add_offset = sig_info.get("trailer_offset_add", 0)
-                                    end_pos = trailer_pos + len(trailer) + add_offset
+                            t_pos = buf.find(trailer, h_pos + len(header))
+                            if t_pos != -1:
+                                potential = (t_pos + len(trailer)) - h_pos
+                                if potential <= max_len:
+                                    extra_add = sig.get("trailer_add", 0)
+                                    end_pos = t_pos + len(trailer) + extra_add
 
-                        if end_pos != -1 and end_pos <= buffer_len:
-                            carved_bytes = buffer_data[header_pos:end_pos]
-                            abs_start_offset = buffer_base_offset + header_pos
-                            abs_end_offset = buffer_base_offset + end_pos
+                        if end_pos != -1 and end_pos <= buf_len:
+                            payload = buf[h_pos:end_pos]
+                            abs_start = base_offset + h_pos
+                            abs_end = base_offset + end_pos
 
-                            is_valid, extracted_meta = validate_and_extract_metadata(sig_key, carved_bytes)
-                            hashes = calculate_hashes(carved_bytes)
+                            valid, meta = inspect_artifact(sig_name, payload)
+                            hashes = get_hashes(payload)
 
-                            carved_counter += 1
-                            artifact_id = f"carved_{carved_counter:04d}"
-                            out_filename = f"{artifact_id}_{hashes['sha256'][:8]}.{ext}"
-                            out_filepath = os.path.join(output_dir, out_filename)
+                            count += 1
+                            art_id = f"carved_{count:04d}"
+                            filename = f"{art_id}_{hashes['sha256'][:8]}.{ext}"
+                            out_path = os.path.join(output_dir, filename)
 
-                            with open(out_filepath, "wb") as out_f:
-                                out_f.write(carved_bytes)
+                            with open(out_path, "wb") as f:
+                                f.write(payload)
 
-                            artifact_record = {
-                                "artifact_id": artifact_id,
-                                "filename": out_filename,
+                            carved.append({
+                                "artifact_id": art_id,
+                                "filename": filename,
                                 "extension": ext,
-                                "mime_type": mime_type,
+                                "mime_type": mime,
                                 "carve_method": "SIGNATURE_STREAM",
-                                "offset_start": abs_start_offset,
-                                "offset_end": abs_end_offset,
-                                "size_bytes": len(carved_bytes),
+                                "offset_start": abs_start,
+                                "offset_end": abs_end,
+                                "size_bytes": len(payload),
                                 "hashes": hashes,
-                                "is_valid_structure": is_valid,
-                                "extracted_metadata": extracted_meta,
-                                "recovered_path": os.path.abspath(out_filepath),
+                                "is_valid_structure": valid,
+                                "extracted_metadata": meta,
+                                "recovered_path": os.path.abspath(out_path),
                                 "is_carved_or_deleted": True,
-                            }
-                            carved_artifacts.append(artifact_record)
+                            })
 
-                            start_idx = end_pos
+                            start = end_pos
                         else:
-                            start_idx = header_pos + len(header)
+                            start = h_pos + len(header)
 
                 if not chunk:
                     break
 
                 stream_pos += len(chunk)
-                if len(buffer_data) > self.overlap_size:
-                    carryover_buffer = buffer_data[-self.overlap_size :]
-                else:
-                    carryover_buffer = buffer_data
+                carry = buf[-self.overlap_size :] if len(buf) > self.overlap_size else buf
 
         finally:
-            if should_close:
+            if is_path:
                 stream.close()
 
-        return carved_artifacts
+        return carved
