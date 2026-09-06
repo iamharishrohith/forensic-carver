@@ -8,6 +8,7 @@ from .validator import get_hashes, inspect_artifact
 def find_jpeg_end(data, start=0, max_size=50 * 1024 * 1024):
     pos = start + 2
     limit = min(len(data), start + max_size)
+    hit_limit_in_sos = False
 
     while pos + 4 <= limit:
         if data[pos] != 0xFF:
@@ -35,10 +36,15 @@ def find_jpeg_end(data, start=0, max_size=50 * 1024 * 1024):
                         pos += 1
                 else:
                     pos += 1
+
+            hit_limit_in_sos = True
             break
 
         seg_len = int.from_bytes(data[pos + 2 : pos + 4], "big")
         pos += 2 + seg_len
+
+    if hit_limit_in_sos and limit < start + max_size:
+        return None
 
     last_eoi = data.rfind(b"\xFF\xD9", start + 2, start + max_size)
     if last_eoi != -1:
@@ -97,45 +103,55 @@ class SignatureCarver:
                                 continue
 
                         end_pos = -1
+                        carved_payload = None
 
                         if name == "jpeg":
                             jlen = find_jpeg_end(buf, h_pos, max_len)
-                            if jlen is not None:
+                            if jlen is not None and h_pos + jlen <= buf_len:
                                 end_pos = h_pos + jlen
+                                carved_payload = buf[h_pos:end_pos]
                             else:
-                                cur = stream.tell()
-                                extra = stream.read(min(max_len, 10 * 1024 * 1024))
-                                stream.seek(cur)
-                                if extra:
-                                    temp_buf = buf[h_pos:] + extra
-                                    jlen = find_jpeg_end(temp_buf, 0, max_len)
-                                    if jlen is not None:
-                                        end_pos = h_pos + jlen
-                                        buf = buf[:h_pos] + temp_buf[:jlen]
-                                        buf_len = len(buf)
+                                abs_start = base_offset + h_pos
+                                cur_tell = stream.tell()
+                                stream.seek(abs_start)
+                                lookahead = stream.read(max_len)
+                                stream.seek(cur_tell)
+                                jlen = find_jpeg_end(lookahead, 0, max_len)
+                                if jlen is not None:
+                                    carved_payload = lookahead[:jlen]
+                                    end_pos = h_pos + min(jlen, buf_len - h_pos)
 
                         elif name == "sqlite":
                             dlen = SQLiteCarver.get_length(buf, h_pos)
                             if dlen and dlen <= max_len:
                                 if h_pos + dlen <= buf_len:
                                     end_pos = h_pos + dlen
+                                    carved_payload = buf[h_pos:end_pos]
                                 else:
-                                    needed = (h_pos + dlen) - buf_len
-                                    cur = stream.tell()
-                                    extra = stream.read(needed)
-                                    stream.seek(cur)
-                                    if len(extra) == needed:
-                                        full_data = buf[h_pos:] + extra
-                                        end_pos = h_pos + dlen
-                                        buf = buf[:h_pos] + full_data
-                                        buf_len = len(buf)
+                                    abs_start = base_offset + h_pos
+                                    cur_tell = stream.tell()
+                                    stream.seek(abs_start)
+                                    carved_payload = stream.read(dlen)
+                                    stream.seek(cur_tell)
+                                    if len(carved_payload) == dlen:
+                                        end_pos = h_pos + min(dlen, buf_len - h_pos)
 
                         elif name == "webp":
                             if h_pos + 8 <= buf_len:
                                 payload_len = struct.unpack("<I", buf[h_pos + 4 : h_pos + 8])[0]
                                 wlen = payload_len + 8
-                                if wlen <= max_len and h_pos + wlen <= buf_len:
-                                    end_pos = h_pos + wlen
+                                if wlen <= max_len:
+                                    if h_pos + wlen <= buf_len:
+                                        end_pos = h_pos + wlen
+                                        carved_payload = buf[h_pos:end_pos]
+                                    else:
+                                        abs_start = base_offset + h_pos
+                                        cur_tell = stream.tell()
+                                        stream.seek(abs_start)
+                                        carved_payload = stream.read(wlen)
+                                        stream.seek(cur_tell)
+                                        if len(carved_payload) == wlen:
+                                            end_pos = h_pos + min(wlen, buf_len - h_pos)
 
                         elif name == "pdf":
                             t_pos = buf.find(b"%%EOF", h_pos + len(header))
@@ -145,6 +161,7 @@ class SignatureCarver:
                                     end_pos += 2
                                 elif end_pos < buf_len and buf[end_pos : end_pos + 1] in [b"\n", b"\r"]:
                                     end_pos += 1
+                                carved_payload = buf[h_pos:end_pos]
 
                         elif trailer:
                             t_pos = buf.find(trailer, h_pos + len(header))
@@ -153,14 +170,15 @@ class SignatureCarver:
                                 if potential <= max_len:
                                     extra_add = sig.get("trailer_add", 0)
                                     end_pos = t_pos + len(trailer) + extra_add
+                                    if end_pos <= buf_len:
+                                        carved_payload = buf[h_pos:end_pos]
 
-                        if end_pos != -1 and end_pos <= buf_len:
-                            payload = buf[h_pos:end_pos]
+                        if carved_payload is not None:
                             abs_start = base_offset + h_pos
-                            abs_end = base_offset + end_pos
+                            abs_end = abs_start + len(carved_payload)
 
-                            valid, meta = inspect_artifact(name, payload)
-                            hashes = get_hashes(payload)
+                            valid, meta = inspect_artifact(name, carved_payload)
+                            hashes = get_hashes(carved_payload)
 
                             count += 1
                             art_id = f"carved_{count:04d}"
@@ -168,7 +186,7 @@ class SignatureCarver:
                             out_path = os.path.join(output_dir, filename)
 
                             with open(out_path, "wb") as f:
-                                f.write(payload)
+                                f.write(carved_payload)
 
                             carved_files.append({
                                 "artifact_id": art_id,
@@ -178,7 +196,7 @@ class SignatureCarver:
                                 "carve_method": "SIGNATURE_STREAM",
                                 "offset_start": abs_start,
                                 "offset_end": abs_end,
-                                "size_bytes": len(payload),
+                                "size_bytes": len(carved_payload),
                                 "hashes": hashes,
                                 "is_valid_structure": valid,
                                 "extracted_metadata": meta,
@@ -186,7 +204,7 @@ class SignatureCarver:
                                 "is_carved_or_deleted": True,
                             })
 
-                            start = end_pos
+                            start = end_pos if end_pos != -1 else h_pos + len(header)
                         else:
                             start = h_pos + len(header)
 

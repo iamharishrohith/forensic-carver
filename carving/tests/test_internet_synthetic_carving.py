@@ -25,7 +25,7 @@ class TestInternetSyntheticCarving(unittest.TestCase):
         _, ground_truth = build_synthetic_raw_image(
             output_raw_path=raw_image,
             cache_dir=cache_folder,
-            total_size_mb=25,
+            total_size_mb=50,
         )
 
         manager = CarvingManager(chunk_size=4 * 1024 * 1024, overlap_size=64 * 1024)
@@ -43,12 +43,13 @@ class TestInternetSyntheticCarving(unittest.TestCase):
 
         for name, expected in ground_truth.items():
             expected_hash = expected["sha256"]
-            self.assertIn(expected_hash, recovered_hashes)
+            self.assertIn(expected_hash, recovered_hashes, f"Missing {name}")
             item = recovered_hashes[expected_hash]
             self.assertTrue(item["is_valid_structure"])
             self.assertTrue(os.path.exists(item["recovered_path"]))
 
-        sqlite_hash = ground_truth["evidence_chats.sqlite"]["sha256"]
+        # Check SQLite chat history
+        sqlite_hash = ground_truth["suspect_chat_history.sqlite"]["sha256"]
         sqlite_item = recovered_hashes[sqlite_hash]
         tables = sqlite_item["extracted_metadata"].get("tables", [])
         self.assertIn("messages", tables)
