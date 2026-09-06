@@ -83,7 +83,6 @@ def download_all_samples(cache_folder):
 
         samples[name] = data
 
-    # Add realistic forensic databases and archive
     samples["suspect_chat_history.sqlite"] = make_chat_db()
     samples["suspect_browser_history.sqlite"] = make_browser_history_db()
     samples["confidential_archive.zip"] = make_evidence_zip()
@@ -92,28 +91,25 @@ def download_all_samples(cache_folder):
 
 
 def build_synthetic_raw_image(output_raw_path, cache_dir="./evidence_cache", total_size_mb=1024):
-    """
-    Builds a raw forensic disk image (e.g. 1024 MB / 1 GB) streaming directly to disk.
-    Spreads real evidence files across unallocated sectors.
-    """
     os.makedirs(os.path.dirname(os.path.abspath(output_raw_path)), exist_ok=True)
     samples = download_all_samples(cache_dir)
 
     total_bytes = total_size_mb * 1024 * 1024
-    ground_truth = {}
-
-    # Calculate gap between files to distribute evenly across the 1 GB drive
+    total_samples_len = sum(len(d) for d in samples.values())
     num_files = len(samples)
-    gap_size = max(1024 * 1024, (total_bytes - (50 * 1024 * 1024)) // (num_files + 1))
 
-    current_offset = 64 * 1024  # 64 KB after MBR
+    # Dynamic gap so all files fit evenly across any disk size
+    avail_gap_space = max(0, total_bytes - total_samples_len - (128 * 1024))
+    gap_size = max(32 * 1024, avail_gap_space // (num_files + 1))
+
+    ground_truth = {}
+    current_offset = 64 * 1024
 
     with open(output_raw_path, "wb") as f:
-        # Write MBR sector
+        # MBR header
         mbr = b"\xEB\x58\x90MSDOS5.0" + (b"\xAA\x55" * 252)
         f.write(mbr)
 
-        # Pad to first file offset
         if current_offset > len(mbr):
             f.write(b"\x00" * (current_offset - len(mbr)))
 
@@ -125,7 +121,6 @@ def build_synthetic_raw_image(output_raw_path, cache_dir="./evidence_cache", tot
             file_sha256 = hashlib.sha256(data).hexdigest()
             file_md5 = hashlib.md5(data).hexdigest()
 
-            # Write file payload
             f.write(data)
 
             ground_truth[name] = {
@@ -139,7 +134,6 @@ def build_synthetic_raw_image(output_raw_path, cache_dir="./evidence_cache", tot
 
             current_offset += file_len
 
-            # Write unallocated slack space gap (in 4MB blocks)
             gap_remaining = min(gap_size, total_bytes - current_offset)
             if gap_remaining > 0:
                 block_size = 4 * 1024 * 1024
@@ -149,7 +143,6 @@ def build_synthetic_raw_image(output_raw_path, cache_dir="./evidence_cache", tot
                     gap_remaining -= write_size
                     current_offset += write_size
 
-        # Pad remaining space up to total_bytes
         if current_offset < total_bytes:
             remaining = total_bytes - current_offset
             block_size = 4 * 1024 * 1024

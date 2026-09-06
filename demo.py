@@ -1,3 +1,11 @@
+"""
+Interactive Forensic Demo:
+1. Shows real evidence files inside original folder.
+2. Simulates suspect deleting all files into raw unallocated drive sectors.
+3. Runs the Forensic Carving Engine to recover all deleted files.
+4. Shows side-by-side cryptographic verification (Before vs After).
+"""
+
 import os
 import sys
 import json
@@ -8,85 +16,127 @@ import argparse
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 from carving.manager import CarvingManager
-from carving.tests.download_and_build_dataset import build_synthetic_raw_image
+from carving.tests.download_and_build_dataset import download_all_samples, build_synthetic_raw_image
 
 
-def run_live_demo(size_mb=1024):
-    print("\n" + "=" * 78)
-    print("      LIVE FORENSIC DEMO: FILE CARVING & DELETED EVIDENCE RECOVERY      ")
-    print(f"               [ TARGET DRIVE SIZE: {size_mb} MB ({size_mb/1024:.1f} GB) ]                ")
-    print("=" * 78)
+def run_interactive_demo(size_mb=1024, auto_mode=False):
+    original_folder = "original_suspect_files"
+    raw_disk_image = f"suspect_{size_mb}MB_drive.raw"
+    recovered_folder = "recovered_evidence"
 
-    raw_image_path = f"suspect_{size_mb}MB_drive.raw"
-    recovered_dir = "demo_recovered_evidence"
+    # Clean previous demo runs
+    for path in [original_folder, recovered_folder, raw_disk_image]:
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        elif os.path.isfile(path):
+            os.remove(path)
 
-    # Clean previous output
-    if os.path.exists(recovered_dir):
-        shutil.rmtree(recovered_dir, ignore_errors=True)
+    print("\n" + "=" * 80)
+    print("        FORENSIC INVESTIGATION DEMO: FILE CARVING & DELETED RECOVERY       ")
+    print(f"                     [ EVIDENCE DRIVE SIZE: {size_mb} MB ]                       ")
+    print("=" * 80)
 
     # -------------------------------------------------------------
-    # STEP 1: Create Evidence & Simulate File Deletion
+    # PHASE 1: SHOW ORIGINAL FILES INSIDE
     # -------------------------------------------------------------
-    print(f"\n[STEP 1] Generating {size_mb} MB Raw Forensic Drive with Real-World Media...")
-    print("  -> Fetching real DSLR camera JPEGs, PDFs, WebPs, PNGs...")
-    print("  -> Generating suspect SQLite chat databases, browser history, & ZIP archives...")
-    print("  -> Distributing files across 1 GB unallocated sectors...")
+    print("\n" + "-" * 80)
+    print(" [PHASE 1] ORIGINAL EVIDENCE FILES (Before Deletion)")
+    print("-" * 80)
+    print("  -> Populating original evidence files on suspect computer...")
 
-    t_build_start = time.perf_counter()
-    _, ground_truth = build_synthetic_raw_image(
-        output_raw_path=raw_image_path,
+    samples = download_all_samples("./evidence_cache")
+    os.makedirs(original_folder, exist_ok=True)
+
+    ground_truth = {}
+    for name, data in samples.items():
+        file_path = os.path.join(original_folder, name)
+        with open(file_path, "wb") as f:
+            f.write(data)
+
+        ground_truth[name] = {
+            "size": len(data),
+            "sha256": manager_hash(data),
+            "path": os.path.abspath(file_path),
+        }
+
+    print(f"\n[+] Created folder: {os.path.abspath(original_folder)}")
+    print(f"[+] Total files currently present: {len(ground_truth)}")
+    print(f"\n{'FILE NAME':<32} | {'SIZE':<10} | {'PRE-DELETION SHA-256'}")
+    print("-" * 80)
+    for name, info in ground_truth.items():
+        print(f"{name:<32} | {info['size']:8,} B | {info['sha256'][:24]}...")
+    print("-" * 80)
+
+    print("\n[*] NOTE: You can open 'original_suspect_files/' in File Explorer right now to view them.")
+    if not auto_mode:
+        input("\n>>> Press ENTER to simulate SUSPECT DELETING THESE FILES... ")
+
+    # -------------------------------------------------------------
+    # PHASE 2: SIMULATE DELETION (SHOW WHICH FILES DELETED)
+    # -------------------------------------------------------------
+    print("\n" + "-" * 80)
+    print(" [PHASE 2] SUSPECT DELETION & RAW DISK IMAGING")
+    print("-" * 80)
+    print(f"  -> Building {size_mb} MB raw disk image with unallocated sectors...")
+
+    build_synthetic_raw_image(
+        output_raw_path=raw_disk_image,
         cache_dir="./evidence_cache",
         total_size_mb=size_mb,
     )
-    t_build = time.perf_counter() - t_build_start
 
-    print(f"\n[+] Raw Evidence Drive Created in {t_build:.2f}s: {os.path.abspath(raw_image_path)}")
-    print(f"[+] Total files deleted/hidden across the drive: {len(ground_truth)}")
-    print("-" * 78)
-    for name, info in ground_truth.items():
-        print(f"  * {name:30} | Size: {info['size_bytes']:9,} bytes | Offset: {info['offset_start']:10,} | SHA256: {info['sha256'][:16]}...")
-    print("-" * 78)
+    # Now delete original folder to simulate deletion
+    shutil.rmtree(original_folder, ignore_errors=True)
 
-    print("\n>>> All file references have been wiped from filesystem directory tables.")
-    print(">>> Files now exist only as raw bytes in unallocated drive sectors.")
-    
-    # Check if run with --auto or interactive
-    if "--auto" not in sys.argv:
-        input("\n>>> Press ENTER to launch the Carving Engine across the 1 GB drive... ")
+    print("\n[!] SUSPECT ACTION TRIGGERED:")
+    print(f"  [X] DELETED DIRECTORY : {os.path.abspath(original_folder)}")
+    print("  [X] DELETED FILES     :")
+    for name in ground_truth.keys():
+        print(f"      - {name} (DELETED)")
+
+    print(f"\n[+] The files are now wiped from filesystem tables.")
+    print(f"[+] Only raw disk bytes remain in: {os.path.abspath(raw_disk_image)} ({os.path.getsize(raw_disk_image):,} bytes)")
+
+    if not auto_mode:
+        input("\n>>> Press ENTER to launch our CARVING RECOVERY ENGINE on the raw disk... ")
 
     # -------------------------------------------------------------
-    # STEP 2: Execute Carving Engine
+    # PHASE 3: EXECUTE CARVING RECOVERY ENGINE
     # -------------------------------------------------------------
-    print(f"\n[STEP 2] Executing Sliding-Window Stream Carver across {size_mb} MB ({os.path.getsize(raw_image_path):,} bytes)...")
+    print("\n" + "-" * 80)
+    print(" [PHASE 3] EXECUTING FORENSIC CARVING ENGINE")
+    print("-" * 80)
+    print("  -> Scanning raw binary stream in 4 MB chunks with 64 KB overlap...")
+
     t0 = time.perf_counter()
-
     manager = CarvingManager(chunk_size=4 * 1024 * 1024, overlap_size=64 * 1024)
     manifest = manager.process_source(
-        source_path=raw_image_path,
-        output_dir=recovered_dir,
-        case_id="DEMO-LIVE-MEET-2026",
+        source_path=raw_disk_image,
+        output_dir=recovered_folder,
+        case_id="DEMO-2026-T1",
     )
+    elapsed = time.perf_counter() - t0
+    speed = size_mb / elapsed if elapsed > 0 else 0
 
-    duration = time.perf_counter() - t0
-    mb_per_sec = size_mb / duration if duration > 0 else 0
-    print(f"[+] Carving finished in {duration:.3f} seconds! (Throughput: {mb_per_sec:.1f} MB/s)")
+    print(f"[+] Carving complete in {elapsed:.3f} seconds! (Speed: {speed:.1f} MB/s)")
+    print(f"[+] Total files extracted: {manifest['summary']['total_artifacts_recovered']}")
 
     # -------------------------------------------------------------
-    # STEP 3: Cryptographic Integrity Verification (Side-by-Side)
+    # PHASE 4: PROOF & VERIFICATION (BEFORE vs AFTER)
     # -------------------------------------------------------------
-    print("\n" + "=" * 78)
-    print(" [STEP 3] CRYPTOGRAPHIC INTEGRITY VERIFICATION (BEFORE vs AFTER)")
-    print("=" * 78)
+    print("\n" + "=" * 80)
+    print(" [PHASE 4] CRYPTOGRAPHIC INTEGRITY VERIFICATION (BEFORE vs AFTER)")
+    print("=" * 80)
 
     recovered_artifacts = manifest["artifacts"]
     recovered_map = {a["hashes"]["sha256"]: a for a in recovered_artifacts}
 
-    print(f"{'FILE NAME':<30} | {'ORIGINAL SHA-256':<16} | {'CARVED SHA-256':<16} | {'STATUS'}")
-    print("-" * 78)
+    print(f"{'DELETED FILE NAME':<30} | {'ORIGINAL SHA-256':<16} | {'RECOVERED SHA-256':<16} | {'STATUS'}")
+    print("-" * 80)
 
     all_matched = True
-    for name, gt in ground_truth.items():
-        orig_hash = gt["sha256"]
+    for name, info in ground_truth.items():
+        orig_hash = info["sha256"]
         if orig_hash in recovered_map:
             carved_art = recovered_map[orig_hash]
             carved_hash = carved_art["hashes"]["sha256"]
@@ -98,29 +148,30 @@ def run_live_demo(size_mb=1024):
 
         print(f"{name:<30} | {orig_hash[:16]}... | {carved_hash[:16]}... | {status}")
 
-    print("-" * 78)
+    print("-" * 80)
     if all_matched:
-        print(">>> RESULT: ALL 15 REAL EVIDENCE FILES RECOVERED WITH 100% BIT-EXACT INTEGRITY! <<<")
+        print(">>> SUCCESS: 100% OF DELETED EVIDENCE RECOVERED WITH ZERO CORRUPTION! <<<")
 
-    # -------------------------------------------------------------
-    # STEP 4: Metadata & Output Manifest Inspection
-    # -------------------------------------------------------------
-    print("\n[STEP 4] Output Deliverables for Pipeline / Court:")
-    print(f"  * Recovered Files Directory : {os.path.abspath(os.path.join(recovered_dir, 'recovered_artifacts'))}")
-    print(f"  * JSON Manifest             : {manifest.get('manifest_saved_to')}")
-    print(f"  * Streaming NDJSON          : {manifest.get('ndjson_saved_to')}")
-    print(f"  * Total Bytes Recovered     : {manifest['summary']['total_recovered_bytes']:,} bytes")
-    print(f"  * Artifacts by MIME Type    : {json.dumps(manifest['summary']['artifacts_by_type'], indent=2)}")
+    print("\n[+] Deliverables Ready for Investigation:")
+    print(f"  * Recovered Files Folder : {os.path.abspath(os.path.join(recovered_folder, 'recovered_artifacts'))}")
+    print(f"  * JSON Manifest Dossier  : {manifest.get('manifest_saved_to')}")
+    print(f"  * Streaming NDJSON       : {manifest.get('ndjson_saved_to')}")
+    print(f"  * Breakdown by Type      : {json.dumps(manifest['summary']['artifacts_by_type'], indent=2)}")
 
-    print("\n" + "=" * 78)
-    print("                      DEMO COMPLETED SUCCESSFULLY                      ")
-    print("=" * 78 + "\n")
+    print("\n" + "=" * 80)
+    print("                         DEMO COMPLETE                          ")
+    print("=" * 80 + "\n")
+
+
+def manager_hash(data):
+    import hashlib
+    return hashlib.sha256(data).hexdigest()
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Live Forensic Carving Demo")
+    parser = argparse.ArgumentParser(description="Forensic Carving Live Demo")
     parser.add_argument("--size-mb", type=int, default=1024, help="Drive size in MB (default: 1024 for 1GB)")
-    parser.add_argument("--auto", action="store_true", help="Run without waiting for Enter key")
+    parser.add_argument("--auto", action="store_true", help="Run in non-interactive automatic mode")
     args = parser.parse_args()
 
-    run_live_demo(size_mb=args.size_mb)
+    run_interactive_demo(size_mb=args.size_mb, auto_mode=args.auto)
